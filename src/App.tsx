@@ -36,6 +36,7 @@ const SAMPLE_STAFF: StaffMember[] = [
     location: 'New York, NY',
     order: 1,
   },
+  
   {
     id: '2',
     name: 'Daniel Mercer',
