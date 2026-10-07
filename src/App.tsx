@@ -1,6 +1,15 @@
+// src/App.tsx
 import { useState, useEffect, useRef } from 'react';
-
-const ADMIN_PASSWORD = 'admin2024';
+import {
+  collection, doc, onSnapshot, addDoc, updateDoc, deleteDoc,
+  query, orderBy, serverTimestamp, writeBatch, getDocs,
+  type DocumentData,
+} from 'firebase/firestore';
+import {
+  onAuthStateChanged, signInWithEmailAndPassword, signOut,
+  type User,
+} from 'firebase/auth';
+import { db, auth } from './firebase';
 
 export interface StaffMember {
   id: string;
@@ -19,15 +28,15 @@ export interface StaffMember {
   order: number;
 }
 
-const SAMPLE_STAFF: StaffMember[] = [
+// Only used for the optional "Seed sample data" button in the admin panel.
+const SAMPLE_STAFF: Omit<StaffMember, 'id'>[] = [
   {
-    id: '1',
     name: 'Amara Okonkwo',
     position: 'Chief Executive Officer',
     department: 'Executive',
     email: 'amara.okonkwo@company.com',
     phone: '+1 (555) 001-0001',
-    bio: 'Amara brings over 18 years of leadership experience in technology and operations. She has driven the company\'s expansion into international markets and champions a culture of innovation and integrity.',
+    bio: "Amara brings over 18 years of leadership experience in technology and operations. She has driven the company's expansion into international markets and champions a culture of innovation and integrity.",
     photo: 'https://images.unsplash.com/photo-1531123897727-8f129e1688ce?w=600&h=700&fit=crop&auto=format',
     linkedin: 'linkedin.com/in/amara-okonkwo',
     twitter: '@amaraokonkwo',
@@ -36,9 +45,7 @@ const SAMPLE_STAFF: StaffMember[] = [
     location: 'New York, NY',
     order: 1,
   },
-  
   {
-    id: '2',
     name: 'Daniel Mercer',
     position: 'Chief Technology Officer',
     department: 'Engineering',
@@ -54,7 +61,6 @@ const SAMPLE_STAFF: StaffMember[] = [
     order: 2,
   },
   {
-    id: '3',
     name: 'Sofia Reyes',
     position: 'Head of Design',
     department: 'Design',
@@ -70,7 +76,6 @@ const SAMPLE_STAFF: StaffMember[] = [
     order: 3,
   },
   {
-    id: '4',
     name: 'Marcus Chen',
     position: 'VP of Sales',
     department: 'Sales',
@@ -87,38 +92,100 @@ const SAMPLE_STAFF: StaffMember[] = [
   },
 ];
 
+// ─── Firestore data layer ───────────────────────────────────────────────────
+
+const STAFF_COL = 'staff';
+
+/** Defensive mapper so partial/legacy docs never break the UI. */
+function toStaff(id: string, d: DocumentData): StaffMember {
+  return {
+    id,
+    name: d.name ?? '',
+    position: d.position ?? '',
+    department: d.department ?? '',
+    email: d.email ?? '',
+    phone: d.phone ?? '',
+    bio: d.bio ?? '',
+    photo: d.photo ?? '',
+    linkedin: d.linkedin ?? '',
+    twitter: d.twitter ?? '',
+    skills: Array.isArray(d.skills) ? d.skills : [],
+    yearsAtCompany: Number(d.yearsAtCompany) || 0,
+    location: d.location ?? '',
+    order: Number(d.order) || 0,
+  };
+}
+
+/**
+ * Real-time staff hook.
+ * Subscribes to the `staff` collection and re-renders on every remote change —
+ * from this tab, another tab, or another user entirely.
+ */
 function useStaff() {
-  const [staff, setStaff] = useState<StaffMember[]>(() => {
-    try {
-      const stored = localStorage.getItem('staff_directory');
-      return stored ? JSON.parse(stored) : SAMPLE_STAFF;
-    } catch {
-      return SAMPLE_STAFF;
-    }
-  });
+  const [staff, setStaff] = useState<StaffMember[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    localStorage.setItem('staff_directory', JSON.stringify(staff));
-  }, [staff]);
+    const q = query(collection(db, STAFF_COL), orderBy('order', 'asc'));
 
-  const addStaff = (member: Omit<StaffMember, 'id' | 'order'>) => {
-    const newMember: StaffMember = {
+    const unsubscribe = onSnapshot(
+      q,
+      snapshot => {
+        setStaff(snapshot.docs.map(d => toStaff(d.id, d.data())));
+        setError(null);
+        setLoading(false);
+      },
+      err => {
+        console.error('[staff] listener error:', err);
+        setError(err.message);
+        setLoading(false);
+      },
+    );
+
+    return unsubscribe; // detach listener on unmount
+  }, []);
+
+  const addStaff = async (member: Omit<StaffMember, 'id' | 'order'>) => {
+    const nextOrder = staff.reduce((max, m) => Math.max(max, m.order), 0) + 1;
+    await addDoc(collection(db, STAFF_COL), {
       ...member,
-      id: Date.now().toString(),
-      order: staff.length + 1,
-    };
-    setStaff(prev => [...prev, newMember]);
+      order: nextOrder,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
   };
 
-  const updateStaff = (id: string, member: Partial<StaffMember>) => {
-    setStaff(prev => prev.map(m => m.id === id ? { ...m, ...member } : m));
+  const updateStaff = async (id: string, member: Partial<StaffMember>) => {
+    const payload: Record<string, unknown> = { ...member };
+    delete payload.id; // never store the doc id inside the doc
+    await updateDoc(doc(db, STAFF_COL, id), {
+      ...payload,
+      updatedAt: serverTimestamp(),
+    });
   };
 
-  const deleteStaff = (id: string) => {
-    setStaff(prev => prev.filter(m => m.id !== id));
+  const deleteStaff = async (id: string) => {
+    await deleteDoc(doc(db, STAFF_COL, id));
   };
 
-  return { staff, addStaff, updateStaff, deleteStaff };
+  return { staff, loading, error, addStaff, updateStaff, deleteStaff };
+}
+
+/** Writes the sample team into an empty collection. Safe to call repeatedly. */
+async function seedSampleStaff() {
+  const existing = await getDocs(collection(db, STAFF_COL));
+  if (!existing.empty) return;
+
+  const batch = writeBatch(db);
+  SAMPLE_STAFF.forEach(m => {
+    batch.set(doc(collection(db, STAFF_COL)), {
+      ...m,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  });
+  await batch.commit();
 }
 
 // ─── Barcode SVG ────────────────────────────────────────────────────────────
@@ -191,12 +258,7 @@ function IDCard({ member, onClick }: { member: StaffMember; onClick: () => void 
           }}
         >
           {/* Top color stripe */}
-          <div
-            style={{
-              height: '6px',
-              backgroundColor: deptColor.stripe,
-            }}
-          />
+          <div style={{ height: '6px', backgroundColor: deptColor.stripe }} />
 
           {/* Header row */}
           <div
@@ -204,7 +266,6 @@ function IDCard({ member, onClick }: { member: StaffMember; onClick: () => void 
             style={{ borderBottom: '1px solid #1E1E1E' }}
           >
             <div className="flex items-center gap-2">
-              {/* Logo mark */}
               <div
                 className="flex items-center justify-center text-xs font-bold"
                 style={{
@@ -241,7 +302,6 @@ function IDCard({ member, onClick }: { member: StaffMember; onClick: () => void 
 
           {/* Photo + info */}
           <div className="flex gap-3 p-4">
-            {/* Photo */}
             <div
               className="shrink-0 overflow-hidden"
               style={{
@@ -261,7 +321,6 @@ function IDCard({ member, onClick }: { member: StaffMember; onClick: () => void 
               />
             </div>
 
-            {/* Text info */}
             <div className="flex-1 min-w-0 flex flex-col justify-between">
               <div>
                 <h3
@@ -306,7 +365,6 @@ function IDCard({ member, onClick }: { member: StaffMember; onClick: () => void 
             </div>
           </div>
 
-          {/* Divider */}
           <div style={{ height: '1px', backgroundColor: '#1A1A1A', margin: '0 16px' }} />
 
           {/* Employee ID row */}
@@ -326,10 +384,7 @@ function IDCard({ member, onClick }: { member: StaffMember; onClick: () => void 
           </div>
 
           {/* Barcode */}
-          <div
-            className="px-4 pb-3"
-            style={{ color: '#1E1E1E' }}
-          >
+          <div className="px-4 pb-3" style={{ color: '#1E1E1E' }}>
             <Barcode seed={member.id + member.name} />
             <p
               className="text-center mt-1"
@@ -372,7 +427,6 @@ function StaffModal({ member, onClose }: { member: StaffMember; onClose: () => v
         className="w-full max-w-2xl max-h-[90vh] overflow-y-auto"
         style={{ backgroundColor: '#111111', border: '1px solid #272727', borderRadius: '10px' }}
       >
-        {/* ID Card hero at top of modal */}
         <div
           style={{
             borderRadius: '10px 10px 0 0',
@@ -380,11 +434,9 @@ function StaffModal({ member, onClose }: { member: StaffMember; onClose: () => v
             borderBottom: '1px solid #1E1E1E',
           }}
         >
-          {/* Stripe */}
           <div style={{ height: '8px', backgroundColor: getDeptColor(member.department).stripe }} />
 
           <div className="flex gap-5 p-6" style={{ backgroundColor: '#0E0E0E' }}>
-            {/* Large photo */}
             <div
               className="shrink-0 overflow-hidden"
               style={{
@@ -461,74 +513,73 @@ function StaffModal({ member, onClose }: { member: StaffMember; onClose: () => v
           </div>
         </div>
 
-        {/* Details body */}
         <div className="p-8 flex flex-col gap-6">
-            <p className="text-sm leading-relaxed" style={{ color: '#B8AE9C' }}>
-              {member.bio}
-            </p>
+          <p className="text-sm leading-relaxed" style={{ color: '#B8AE9C' }}>
+            {member.bio}
+          </p>
 
-            <div className="grid grid-cols-1 gap-3">
-              {member.email && (
-                <div className="flex items-center gap-3">
-                  <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Email</span>
-                  <a href={`mailto:${member.email}`} className="text-sm hover:underline" style={{ color: '#C9A84C' }}>
-                    {member.email}
-                  </a>
-                </div>
-              )}
-              {member.phone && (
-                <div className="flex items-center gap-3">
-                  <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Phone</span>
-                  <span className="text-sm" style={{ color: '#B8AE9C' }}>{member.phone}</span>
-                </div>
-              )}
-              {member.location && (
-                <div className="flex items-center gap-3">
-                  <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Office</span>
-                  <span className="text-sm" style={{ color: '#B8AE9C' }}>{member.location}</span>
-                </div>
-              )}
-              {member.yearsAtCompany > 0 && (
-                <div className="flex items-center gap-3">
-                  <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Tenure</span>
-                  <span className="text-sm" style={{ color: '#B8AE9C' }}>{member.yearsAtCompany} {member.yearsAtCompany === 1 ? 'year' : 'years'}</span>
-                </div>
-              )}
-            </div>
-
-            {member.skills.length > 0 && (
-              <div>
-                <p className="text-xs tracking-[0.12em] uppercase mb-3" style={{ color: '#4A4038', fontWeight: 500 }}>Expertise</p>
-                <div className="flex flex-wrap gap-2">
-                  {member.skills.map(skill => (
-                    <span
-                      key={skill}
-                      className="text-xs px-3 py-1"
-                      style={{ border: '1px solid #272727', color: '#8A7D6E', borderRadius: '2px' }}
-                    >
-                      {skill}
-                    </span>
-                  ))}
-                </div>
+          <div className="grid grid-cols-1 gap-3">
+            {member.email && (
+              <div className="flex items-center gap-3">
+                <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Email</span>
+                <a href={`mailto:${member.email}`} className="text-sm hover:underline" style={{ color: '#C9A84C' }}>
+                  {member.email}
+                </a>
               </div>
             )}
+            {member.phone && (
+              <div className="flex items-center gap-3">
+                <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Phone</span>
+                <span className="text-sm" style={{ color: '#B8AE9C' }}>{member.phone}</span>
+              </div>
+            )}
+            {member.location && (
+              <div className="flex items-center gap-3">
+                <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Office</span>
+                <span className="text-sm" style={{ color: '#B8AE9C' }}>{member.location}</span>
+              </div>
+            )}
+            {member.yearsAtCompany > 0 && (
+              <div className="flex items-center gap-3">
+                <span className="text-xs tracking-widest uppercase w-16 shrink-0" style={{ color: '#4A4038' }}>Tenure</span>
+                <span className="text-sm" style={{ color: '#B8AE9C' }}>{member.yearsAtCompany} {member.yearsAtCompany === 1 ? 'year' : 'years'}</span>
+              </div>
+            )}
+          </div>
 
-            <div className="flex gap-4 pt-2">
-              {member.linkedin && (
-                <a href={`https://${member.linkedin}`} target="_blank" rel="noopener noreferrer"
-                  className="text-xs tracking-widest uppercase hover:underline transition-colors"
-                  style={{ color: '#C9A84C' }}>
-                  LinkedIn
-                </a>
-              )}
-              {member.twitter && (
-                <a href={`https://twitter.com/${member.twitter.replace('@', '')}`} target="_blank" rel="noopener noreferrer"
-                  className="text-xs tracking-widest uppercase hover:underline transition-colors"
-                  style={{ color: '#C9A84C' }}>
-                  Twitter
-                </a>
-              )}
+          {member.skills.length > 0 && (
+            <div>
+              <p className="text-xs tracking-[0.12em] uppercase mb-3" style={{ color: '#4A4038', fontWeight: 500 }}>Expertise</p>
+              <div className="flex flex-wrap gap-2">
+                {member.skills.map(skill => (
+                  <span
+                    key={skill}
+                    className="text-xs px-3 py-1"
+                    style={{ border: '1px solid #272727', color: '#8A7D6E', borderRadius: '2px' }}
+                  >
+                    {skill}
+                  </span>
+                ))}
+              </div>
             </div>
+          )}
+
+          <div className="flex gap-4 pt-2">
+            {member.linkedin && (
+              <a href={`https://${member.linkedin}`} target="_blank" rel="noopener noreferrer"
+                className="text-xs tracking-widest uppercase hover:underline transition-colors"
+                style={{ color: '#C9A84C' }}>
+                LinkedIn
+              </a>
+            )}
+            {member.twitter && (
+              <a href={`https://twitter.com/${member.twitter.replace('@', '')}`} target="_blank" rel="noopener noreferrer"
+                className="text-xs tracking-widest uppercase hover:underline transition-colors"
+                style={{ color: '#C9A84C' }}>
+                Twitter
+              </a>
+            )}
+          </div>
         </div>
 
         <div className="border-t flex justify-end px-8 py-4" style={{ borderColor: '#1E1E1E' }}>
@@ -549,17 +600,26 @@ function StaffModal({ member, onClose }: { member: StaffMember; onClose: () => v
 
 // ─── Public Directory Page ──────────────────────────────────────────────────
 
-function PublicPage({ staff, onAdminClick }: { staff: StaffMember[]; onAdminClick: () => void }) {
+function PublicPage({
+  staff,
+  loading,
+  error,
+  onAdminClick,
+}: {
+  staff: StaffMember[];
+  loading: boolean;
+  error: string | null;
+  onAdminClick: () => void;
+}) {
   const [selected, setSelected] = useState<StaffMember | null>(null);
   const [filter, setFilter] = useState('All');
 
-  const departments = ['All', ...Array.from(new Set(staff.map(s => s.department)))];
+  const departments = ['All', ...Array.from(new Set(staff.map(s => s.department).filter(Boolean)))];
   const filtered = filter === 'All' ? staff : staff.filter(s => s.department === filter);
   const sorted = [...filtered].sort((a, b) => a.order - b.order);
 
   return (
     <div className="min-h-screen" style={{ backgroundColor: '#0A0A0A' }}>
-      {/* Header */}
       <header className="border-b sticky top-0 z-40" style={{ borderColor: '#1C1C1C', backgroundColor: 'rgba(10,10,10,0.95)', backdropFilter: 'blur(12px)' }}>
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div>
@@ -580,7 +640,6 @@ function PublicPage({ staff, onAdminClick }: { staff: StaffMember[]; onAdminClic
         </div>
       </header>
 
-      {/* Hero */}
       <section className="max-w-7xl mx-auto px-6 pt-20 pb-16">
         <div className="max-w-2xl">
           <p className="text-xs tracking-[0.2em] uppercase mb-6" style={{ color: '#C9A84C', fontWeight: 500 }}>
@@ -596,8 +655,7 @@ function PublicPage({ staff, onAdminClick }: { staff: StaffMember[]; onAdminClic
         </div>
       </section>
 
-      {/* Filter bar */}
-      {departments.length > 1 && (
+      {!loading && departments.length > 1 && (
         <div className="max-w-7xl mx-auto px-6 pb-10">
           <div className="flex gap-1 flex-wrap">
             {departments.map(dept => (
@@ -619,9 +677,23 @@ function PublicPage({ staff, onAdminClick }: { staff: StaffMember[]; onAdminClic
         </div>
       )}
 
-      {/* Staff grid */}
       <main className="max-w-7xl mx-auto px-6 pb-24">
-        {sorted.length === 0 ? (
+        {loading ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div
+                key={i}
+                className="animate-pulse"
+                style={{ height: 300, backgroundColor: '#111111', border: '1px solid #1C1C1C', borderRadius: '10px' }}
+              />
+            ))}
+          </div>
+        ) : error ? (
+          <div className="py-24 text-center">
+            <p className="text-sm mb-2" style={{ color: '#ef4444' }}>Could not load the directory.</p>
+            <p className="text-xs" style={{ color: '#4A4038' }}>{error}</p>
+          </div>
+        ) : sorted.length === 0 ? (
           <div className="py-24 text-center">
             <p className="text-sm" style={{ color: '#4A4038' }}>No staff members found.</p>
           </div>
@@ -634,7 +706,6 @@ function PublicPage({ staff, onAdminClick }: { staff: StaffMember[]; onAdminClic
         )}
       </main>
 
-      {/* Footer */}
       <footer className="border-t" style={{ borderColor: '#1C1C1C' }}>
         <div className="max-w-7xl mx-auto px-6 py-8 flex items-center justify-between">
           <p className="text-xs" style={{ color: '#2A2A2A' }}>© {new Date().getFullYear()} Company Directory</p>
@@ -660,13 +731,15 @@ function StaffForm({
   onCancel,
 }: {
   initial?: StaffMember;
-  onSave: (data: Omit<StaffMember, 'id' | 'order'>) => void;
+  onSave: (data: Omit<StaffMember, 'id' | 'order'>) => void | Promise<void>;
   onCancel: () => void;
 }) {
   const [form, setForm] = useState<Omit<StaffMember, 'id' | 'order'>>(
     initial ? { ...initial } : { ...EMPTY_FORM }
   );
   const [skillInput, setSkillInput] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const field = (key: keyof typeof form) => ({
     value: form[key] as string | number,
@@ -684,6 +757,19 @@ function StaffForm({
 
   const removeSkill = (skill: string) =>
     setForm(prev => ({ ...prev, skills: prev.skills.filter(s => s !== skill) }));
+
+  const handleSave = async () => {
+    if (!form.name.trim() || !form.position.trim() || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await onSave(form);
+    } catch (err) {
+      console.error('[staff] save failed:', err);
+      setSaveError(err instanceof Error ? err.message : 'Save failed. Please try again.');
+      setSaving(false);
+    }
+  };
 
   const inputClass = "w-full px-3 py-2 text-sm transition-all rounded-none";
   const inputStyle = {
@@ -804,10 +890,15 @@ function StaffForm({
         </div>
       </div>
 
+      {saveError && (
+        <p className="mt-6 text-xs" style={{ color: '#ef4444' }}>{saveError}</p>
+      )}
+
       <div className="flex gap-3 mt-8 justify-end">
         <button
           onClick={onCancel}
-          className="text-xs tracking-widest uppercase px-5 py-2 transition-all"
+          disabled={saving}
+          className="text-xs tracking-widest uppercase px-5 py-2 transition-all disabled:opacity-40"
           style={{ border: '1px solid #272727', color: '#4A4038', borderRadius: '2px' }}
           onMouseEnter={e => (e.currentTarget.style.color = '#F2EDE4')}
           onMouseLeave={e => (e.currentTarget.style.color = '#4A4038')}
@@ -815,16 +906,14 @@ function StaffForm({
           Cancel
         </button>
         <button
-          onClick={() => {
-            if (!form.name.trim() || !form.position.trim()) return;
-            onSave(form);
-          }}
-          className="text-xs tracking-widest uppercase px-6 py-2 transition-all"
+          onClick={handleSave}
+          disabled={saving}
+          className="text-xs tracking-widest uppercase px-6 py-2 transition-all disabled:opacity-60"
           style={{ backgroundColor: '#C9A84C', color: '#0A0A0A', borderRadius: '2px', fontWeight: 600 }}
           onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#D4B35A')}
           onMouseLeave={e => (e.currentTarget.style.backgroundColor = '#C9A84C')}
         >
-          {initial ? 'Save Changes' : 'Add Member'}
+          {saving ? 'Saving…' : initial ? 'Save Changes' : 'Add Member'}
         </button>
       </div>
     </div>
@@ -838,23 +927,39 @@ function AdminPage({
   onAdd,
   onUpdate,
   onDelete,
+  onSeed,
+  onSignOut,
   onBack,
 }: {
   staff: StaffMember[];
-  onAdd: (m: Omit<StaffMember, 'id' | 'order'>) => void;
-  onUpdate: (id: string, m: Partial<StaffMember>) => void;
-  onDelete: (id: string) => void;
+  onAdd: (m: Omit<StaffMember, 'id' | 'order'>) => Promise<void>;
+  onUpdate: (id: string, m: Partial<StaffMember>) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
+  onSeed: () => Promise<void>;
+  onSignOut: () => void;
   onBack: () => void;
 }) {
   const [view, setView] = useState<'list' | 'add' | 'edit'>('list');
   const [editing, setEditing] = useState<StaffMember | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const sorted = [...staff].sort((a, b) => a.order - b.order);
 
+  const handleDelete = async (id: string) => {
+    setBusy(true);
+    try {
+      await onDelete(id);
+      setConfirmDelete(null);
+    } catch (err) {
+      console.error('[staff] delete failed:', err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="min-h-screen" style={{ backgroundColor: '#0A0A0A' }}>
-      {/* Header */}
       <header className="border-b sticky top-0 z-40" style={{ borderColor: '#1C1C1C', backgroundColor: 'rgba(10,10,10,0.97)', backdropFilter: 'blur(12px)' }}>
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-4">
@@ -868,13 +973,22 @@ function AdminPage({
               ← Directory
             </button>
             <span style={{ color: '#1C1C1C' }}>|</span>
-            <div>
-              <h1 className="font-display text-lg" style={{ fontFamily: 'Playfair Display, serif', color: '#F2EDE4' }}>Admin Panel</h1>
-            </div>
+            <h1 className="font-display text-lg" style={{ fontFamily: 'Playfair Display, serif', color: '#F2EDE4' }}>Admin Panel</h1>
           </div>
-          <span className="text-xs px-3 py-1" style={{ border: '1px solid #C9A84C22', color: '#C9A84C', borderRadius: '2px', backgroundColor: 'rgba(201,168,76,0.06)' }}>
-            {staff.length} members
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs px-3 py-1" style={{ border: '1px solid #C9A84C22', color: '#C9A84C', borderRadius: '2px', backgroundColor: 'rgba(201,168,76,0.06)' }}>
+              {staff.length} members
+            </span>
+            <button
+              onClick={onSignOut}
+              className="text-xs tracking-[0.12em] uppercase px-3 py-1.5 transition-all"
+              style={{ border: '1px solid #272727', color: '#4A4038', borderRadius: '2px' }}
+              onMouseEnter={e => (e.currentTarget.style.borderColor = '#7f1d1d', e.currentTarget.style.color = '#ef4444')}
+              onMouseLeave={e => (e.currentTarget.style.borderColor = '#272727', e.currentTarget.style.color = '#4A4038')}
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </header>
 
@@ -900,9 +1014,19 @@ function AdminPage({
               {sorted.length === 0 && (
                 <div className="py-16 text-center border" style={{ borderColor: '#1C1C1C', borderRadius: '2px' }}>
                   <p className="text-sm mb-4" style={{ color: '#4A4038' }}>No staff members yet.</p>
-                  <button onClick={() => setView('add')} className="text-xs tracking-widest uppercase" style={{ color: '#C9A84C' }}>
-                    Add the first one
-                  </button>
+                  <div className="flex items-center justify-center gap-6">
+                    <button onClick={() => setView('add')} className="text-xs tracking-widest uppercase" style={{ color: '#C9A84C' }}>
+                      Add the first one
+                    </button>
+                    <button
+                      onClick={async () => { setBusy(true); try { await onSeed(); } finally { setBusy(false); } }}
+                      disabled={busy}
+                      className="text-xs tracking-widest uppercase disabled:opacity-40"
+                      style={{ color: '#4A4038' }}
+                    >
+                      {busy ? 'Seeding…' : 'Seed sample data'}
+                    </button>
+                  </div>
                 </div>
               )}
               {sorted.map(member => (
@@ -911,10 +1035,7 @@ function AdminPage({
                   className="flex items-center gap-4 p-4 transition-colors"
                   style={{ backgroundColor: '#0F0F0F', border: '1px solid #1C1C1C', borderRadius: '2px' }}
                 >
-                  <div
-                    className="w-12 h-14 shrink-0 bg-[#1a1a1a] overflow-hidden"
-                    style={{ borderRadius: '2px' }}
-                  >
+                  <div className="w-12 h-14 shrink-0 bg-[#1a1a1a] overflow-hidden" style={{ borderRadius: '2px' }}>
                     <img
                       src={member.photo || `https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=200&h=250&fit=crop`}
                       alt={member.name}
@@ -940,17 +1061,14 @@ function AdminPage({
                     {confirmDelete === member.id ? (
                       <div className="flex items-center gap-1">
                         <button
-                          onClick={() => { onDelete(member.id); setConfirmDelete(null); }}
-                          className="text-xs tracking-widest uppercase px-3 py-1.5 transition-all"
+                          onClick={() => handleDelete(member.id)}
+                          disabled={busy}
+                          className="text-xs tracking-widest uppercase px-3 py-1.5 transition-all disabled:opacity-50"
                           style={{ border: '1px solid #7f1d1d', color: '#ef4444', borderRadius: '2px' }}
                         >
                           Confirm
                         </button>
-                        <button
-                          onClick={() => setConfirmDelete(null)}
-                          className="text-xs px-2 py-1.5"
-                          style={{ color: '#4A4038' }}
-                        >
+                        <button onClick={() => setConfirmDelete(null)} className="text-xs px-2 py-1.5" style={{ color: '#4A4038' }}>
                           ×
                         </button>
                       </div>
@@ -974,7 +1092,7 @@ function AdminPage({
 
         {view === 'add' && (
           <StaffForm
-            onSave={data => { onAdd(data); setView('list'); }}
+            onSave={async data => { await onAdd(data); setView('list'); }}
             onCancel={() => setView('list')}
           />
         )}
@@ -982,7 +1100,7 @@ function AdminPage({
         {view === 'edit' && editing && (
           <StaffForm
             initial={editing}
-            onSave={data => { onUpdate(editing.id, data); setView('list'); setEditing(null); }}
+            onSave={async data => { await onUpdate(editing.id, data); setView('list'); setEditing(null); }}
             onCancel={() => { setView('list'); setEditing(null); }}
           />
         )}
@@ -991,22 +1109,36 @@ function AdminPage({
   );
 }
 
-// ─── Admin Login ─────────────────────────────────────────────────────────────
+// ─── Admin Login (Firebase Auth) ────────────────────────────────────────────
 
 function AdminLogin({ onSuccess, onBack }: { onSuccess: () => void; onBack: () => void }) {
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { inputRef.current?.focus(); }, []);
 
-  const attempt = () => {
-    if (password === ADMIN_PASSWORD) {
+  const attempt = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), password);
       onSuccess();
-    } else {
-      setError(true);
+    } catch (err: any) {
+      const code = err?.code ?? '';
+      setError(
+        code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found'
+          ? 'Invalid email or password.'
+          : code === 'auth/too-many-requests'
+            ? 'Too many attempts. Try again shortly.'
+            : err?.message ?? 'Sign in failed.',
+      );
       setPassword('');
-      setTimeout(() => setError(false), 2000);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -1018,19 +1150,20 @@ function AdminLogin({ onSuccess, onBack }: { onSuccess: () => void; onBack: () =
           <h2 className="font-display text-4xl mb-2" style={{ fontFamily: 'Playfair Display, serif', color: '#F2EDE4' }}>
             Staff Directory
           </h2>
-          <p className="text-sm" style={{ color: '#4A4038' }}>Enter your admin password to continue.</p>
+          <p className="text-sm" style={{ color: '#4A4038' }}>Sign in with your admin account.</p>
         </div>
 
         <div className="space-y-4">
           <div>
-            <label className="block mb-2 text-xs tracking-widest uppercase" style={{ color: '#4A4038' }}>Password</label>
+            <label className="block mb-2 text-xs tracking-widest uppercase" style={{ color: '#4A4038' }}>Email</label>
             <input
               ref={inputRef}
-              type="password"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
+              type="email"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && attempt()}
-              placeholder="••••••••"
+              placeholder="admin@company.com"
+              autoComplete="username"
               className="w-full px-4 py-3 text-sm transition-all"
               style={{
                 backgroundColor: '#0F0F0F',
@@ -1040,17 +1173,37 @@ function AdminLogin({ onSuccess, onBack }: { onSuccess: () => void; onBack: () =
                 outline: 'none',
               }}
             />
-            {error && <p className="mt-2 text-xs" style={{ color: '#ef4444' }}>Incorrect password.</p>}
+          </div>
+          <div>
+            <label className="block mb-2 text-xs tracking-widest uppercase" style={{ color: '#4A4038' }}>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && attempt()}
+              placeholder="••••••••"
+              autoComplete="current-password"
+              className="w-full px-4 py-3 text-sm transition-all"
+              style={{
+                backgroundColor: '#0F0F0F',
+                border: `1px solid ${error ? '#ef4444' : '#272727'}`,
+                color: '#F2EDE4',
+                borderRadius: '2px',
+                outline: 'none',
+              }}
+            />
+            {error && <p className="mt-2 text-xs" style={{ color: '#ef4444' }}>{error}</p>}
           </div>
 
           <button
             onClick={attempt}
-            className="w-full py-3 text-xs tracking-[0.15em] uppercase transition-all font-semibold"
+            disabled={busy}
+            className="w-full py-3 text-xs tracking-[0.15em] uppercase transition-all font-semibold disabled:opacity-60"
             style={{ backgroundColor: '#C9A84C', color: '#0A0A0A', borderRadius: '2px' }}
             onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#D4B35A')}
             onMouseLeave={e => (e.currentTarget.style.backgroundColor = '#C9A84C')}
           >
-            Enter
+            {busy ? 'Signing in…' : 'Enter'}
           </button>
 
           <button
@@ -1063,10 +1216,6 @@ function AdminLogin({ onSuccess, onBack }: { onSuccess: () => void; onBack: () =
             Back to Directory
           </button>
         </div>
-
-        <p className="mt-8 text-xs text-center" style={{ color: '#1C1C1C' }}>
-          Default: admin2024
-        </p>
       </div>
     </div>
   );
@@ -1077,32 +1226,54 @@ function AdminLogin({ onSuccess, onBack }: { onSuccess: () => void; onBack: () =
 type AppView = 'public' | 'login' | 'admin';
 
 export default function App() {
-  const { staff, addStaff, updateStaff, deleteStaff } = useStaff();
+  const { staff, loading, error, addStaff, updateStaff, deleteStaff } = useStaff();
   const [view, setView] = useState<AppView>('public');
-  const [authenticated, setAuthenticated] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
 
-  const goAdmin = () => {
-    if (authenticated) setView('admin');
-    else setView('login');
+  // Keeps the admin session alive across reloads.
+  useEffect(() => {
+    return onAuthStateChanged(auth, u => {
+      setUser(u);
+      setAuthReady(true);
+      if (!u) setView(v => (v === 'admin' ? 'public' : v));
+    });
+  }, []);
+
+  const goAdmin = () => setView(user ? 'admin' : 'login');
+
+  const handleSignOut = async () => {
+    await signOut(auth);
+    setView('public');
   };
+
+  if (!authReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ backgroundColor: '#0A0A0A' }}>
+        <p className="text-xs tracking-[0.2em] uppercase" style={{ color: '#4A4038' }}>Loading…</p>
+      </div>
+    );
+  }
 
   return (
     <>
       {view === 'public' && (
-        <PublicPage staff={staff} onAdminClick={goAdmin} />
+        <PublicPage staff={staff} loading={loading} error={error} onAdminClick={goAdmin} />
       )}
       {view === 'login' && (
         <AdminLogin
-          onSuccess={() => { setAuthenticated(true); setView('admin'); }}
+          onSuccess={() => setView('admin')}
           onBack={() => setView('public')}
         />
       )}
-      {view === 'admin' && (
+      {view === 'admin' && user && (
         <AdminPage
           staff={staff}
           onAdd={addStaff}
           onUpdate={updateStaff}
           onDelete={deleteStaff}
+          onSeed={seedSampleStaff}
+          onSignOut={handleSignOut}
           onBack={() => setView('public')}
         />
       )}
