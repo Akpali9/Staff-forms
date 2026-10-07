@@ -1,4 +1,3 @@
-// src/App.tsx
 import { useState, useEffect, useRef } from 'react';
 import {
   collection, doc, onSnapshot, addDoc, updateDoc, deleteDoc,
